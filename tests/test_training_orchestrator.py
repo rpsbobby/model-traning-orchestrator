@@ -23,6 +23,7 @@ def make_orchestrator(
         poll_interval_seconds=0,
         request_timeout_seconds=1,
         echo_logs_to_stdout=False,
+        health_wait_timeout_seconds=1,
     )
 
 
@@ -235,7 +236,7 @@ def test_poll_logs_until_done_cancels_on_traceback() -> None:
 
 
 @responses.activate
-def test_run_starts_then_polls_until_done() -> None:
+def test_run_starts_then_polls_until_done_without_health_check() -> None:
     raw_logs = io.StringIO()
     events = io.StringIO()
     orchestrator = make_orchestrator(raw_logs, events)
@@ -282,7 +283,10 @@ def test_run_starts_then_polls_until_done() -> None:
         status=200,
     )
 
-    final_status = orchestrator.run(project_type="Classification")
+    final_status = orchestrator.run(
+        project_type="Classification",
+        wait_for_health=False,
+    )
 
     assert final_status["state"] == "done"
     assert raw_logs.getvalue() == "training...\n"
@@ -318,3 +322,105 @@ def test_start_training_sends_existing_config_query_params(tmp_path) -> None:
 
     assert "config_path=" in request_url
     assert "additional_args_path=" in request_url
+
+@responses.activate
+def test_run_waits_for_health_before_starting_training() -> None:
+    raw_logs = io.StringIO()
+    events = io.StringIO()
+    _orchestrator = make_orchestrator(raw_logs, events)
+
+    _orchestrator = TrainingHttpOrchestrator.from_host_port(
+        url="http://trainer",
+        port=8000,
+        raw_log_stream=raw_logs,
+        event_stream=events,
+        poll_interval_seconds=0,
+        request_timeout_seconds=1,
+        echo_logs_to_stdout=False,
+    )
+
+    responses.add(
+        responses.GET,
+        "http://trainer:8000/health",
+        json={"ok": True},
+        status=200,
+    )
+
+    responses.add(
+        responses.POST,
+        "http://trainer:8000/training/start/classification",
+        json={
+            "ok": True,
+            "backend": "classification",
+            "accepted": True,
+            "job_id": "abc123",
+        },
+        status=202,
+    )
+
+    responses.add(
+        responses.GET,
+        "http://trainer:8000/training/jobs/abc123/logs",
+        json={
+            "ok": True,
+            "job_id": "abc123",
+            "backend": "classification",
+            "offset": 0,
+            "next_offset": 12,
+            "chunk": "training...\n",
+            "done": True,
+        },
+        status=200,
+    )
+
+    responses.add(
+        responses.GET,
+        "http://trainer:8000/training/jobs/abc123",
+        json={
+            "ok": True,
+            "job_id": "abc123",
+            "backend": "classification",
+            "state": "done",
+            "pid": 123,
+            "exit_code": 0,
+            "error": "",
+        },
+        status=200,
+    )
+
+    final_status = _orchestrator.run(project_type="Classification")
+
+    assert final_status["state"] == "done"
+
+    assert responses.calls[0].request.method == "GET"
+    assert responses.calls[0].request.url == "http://trainer:8000/health"
+
+    assert responses.calls[1].request.method == "POST"
+    assert responses.calls[1].request.url == (
+        "http://trainer:8000/training/start/classification"
+    )
+
+    assert "health_check_ok" in events.getvalue()
+
+@responses.activate
+def test_wait_for_health_times_out_when_service_never_becomes_healthy() -> None:
+    orchestrator = TrainingHttpOrchestrator.from_host_port(
+        url="http://trainer",
+        port=8000,
+        raw_log_stream=io.StringIO(),
+        event_stream=io.StringIO(),
+        poll_interval_seconds=0,
+        request_timeout_seconds=1,
+        echo_logs_to_stdout=False,
+        health_wait_timeout_seconds=0.01,
+    )
+
+    responses.add(
+        responses.GET,
+        "http://trainer:8000/health",
+        json={"ok": False},
+        status=503,
+    )
+
+    with pytest.raises(TrainingOrchestratorError, match="did not become healthy"):
+        orchestrator.wait_for_health()

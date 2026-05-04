@@ -23,15 +23,17 @@ class TrainingHttpOrchestrator:
     }
 
     def __init__(
-        self,
-        base_url: str,
-        raw_log_stream: IO[str],
-        event_stream: IO[str] | None = None,
-        poll_interval_seconds: float = 1.0,
-        request_timeout_seconds: float = 10.0,
-        log_limit_bytes: int = 256 * 1024,
-        max_poll_errors: int = 5,
-        echo_logs_to_stdout: bool = True,
+            self,
+            base_url: str,
+            raw_log_stream: IO[str],
+            event_stream: IO[str] | None = None,
+            poll_interval_seconds: float = 1.0,
+            request_timeout_seconds: float = 10.0,
+            log_limit_bytes: int = 256 * 1024,
+            max_poll_errors: int = 5,
+            echo_logs_to_stdout: bool = True,
+            health_endpoint: str = "/health",
+            health_wait_timeout_seconds: float = 120.0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.raw_log_stream = raw_log_stream
@@ -47,6 +49,8 @@ class TrainingHttpOrchestrator:
         self.project_type: str | None = None
         self.log_offset = 0
         self.poll_error_count = 0
+        self.health_endpoint = health_endpoint
+        self.health_wait_timeout_seconds = health_wait_timeout_seconds
 
     @classmethod
     def from_host_port(
@@ -65,11 +69,15 @@ class TrainingHttpOrchestrator:
         )
 
     def run(
-        self,
-        project_type: str,
-        config_path: str | None = None,
-        additional_args_path: str | None = None,
+            self,
+            project_type: str,
+            config_path: str | None = None,
+            additional_args_path: str | None = None,
+            wait_for_health: bool = True,
     ) -> dict[str, Any]:
+        if wait_for_health:
+            self.wait_for_health()
+
         self.start_training(
             project_type=project_type,
             config_path=config_path,
@@ -357,6 +365,67 @@ class TrainingHttpOrchestrator:
             raise TrainingOrchestratorError("No active training job. Call start_training() first.")
 
         return self.job_id
+
+    def wait_for_health(self) -> dict[str, Any]:
+        health_url = f"{self.base_url}{self.health_endpoint}"
+        deadline = time.monotonic() + self.health_wait_timeout_seconds
+        last_error = ""
+
+        self._write_event(
+            "health_wait_started",
+            {
+                "url": health_url,
+                "timeout_seconds": self.health_wait_timeout_seconds,
+            },
+        )
+
+        while time.monotonic() < deadline:
+            try:
+                response = requests.get(
+                    health_url,
+                    timeout=self.request_timeout_seconds,
+                )
+
+                if response.ok:
+                    try:
+                        payload = self._read_json_response(response)
+                    except TrainingOrchestratorError:
+                        payload = {
+                            "ok": True,
+                            "status_code": response.status_code,
+                            "body": response.text,
+                        }
+
+                    self._write_event(
+                        "health_check_ok",
+                        {
+                            "url": health_url,
+                            "status_code": response.status_code,
+                            "response": payload,
+                        },
+                    )
+
+                    return payload
+
+                last_error = f"HTTP {response.status_code}: {response.text}"
+
+            except requests.RequestException as exc:
+                last_error = str(exc)
+
+            self._write_event(
+                "health_check_retry",
+                {
+                    "url": health_url,
+                    "error": last_error,
+                },
+            )
+
+            time.sleep(self.poll_interval_seconds)
+
+        raise TrainingOrchestratorError(
+            "Training service did not become healthy within "
+            f"{self.health_wait_timeout_seconds} seconds. Last error: {last_error}"
+        )
 
     @staticmethod
     def _read_json_response(response: requests.Response) -> dict[str, Any]:
